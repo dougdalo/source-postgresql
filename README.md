@@ -1,5 +1,10 @@
 # source-postgresql
 
+[![Go Version](https://img.shields.io/badge/Go-1.23-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/devel/release#go1.23.0)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-logical%20replication-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/docs/current/logical-replication.html)
+[![Kafka](https://img.shields.io/badge/Kafka-producer-231F20?logo=apachekafka&logoColor=white)](https://kafka.apache.org/)
+
 Source de CDC pra Postgres: faz o snapshot inicial das tabelas/views
 configuradas e depois segue capturando mudanças via replicação lógica (slot +
 plugin `pgoutput`), publicando tudo em um tópico Kafka.
@@ -235,3 +240,7 @@ offset por mensagem — é um loop de background), a própria pipeline se
 reinicia sozinha com backoff exponencial (5s a 2min) se cair por qualquer
 motivo (conexão derrubada, erro do Postgres, etc.), retomando do último
 `confirmed_lsn`/progresso de snapshot salvo no `STATE_TOPIC`.
+
+## Licença
+
+Distribuído sob a licença [MIT](LICENSE).
