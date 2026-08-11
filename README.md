@@ -1,6 +1,6 @@
 # source-postgresql
 
-[![Go Version](https://img.shields.io/badge/Go-1.23-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/devel/release#go1.23.0)
+[![Go Version](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/devel/release#go1.25.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-logical%20replication-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/docs/current/logical-replication.html)
 [![Kafka](https://img.shields.io/badge/Kafka-producer-231F20?logo=apachekafka&logoColor=white)](https://kafka.apache.org/)
