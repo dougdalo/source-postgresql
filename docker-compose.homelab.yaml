@@ -1,0 +1,59 @@
+services:
+  zookeeper:
+    image: quay.io/debezium/zookeeper:2.5
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: quay.io/debezium/kafka:2.5
+    depends_on: [zookeeper]
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      - ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://192.168.1.100:9094
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+
+  connect:
+    image: quay.io/debezium/connect:3.0
+    depends_on: [kafka, postgres-test]
+    ports:
+      - "8083:8083"
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - GROUP_ID=iceberg-sink-group
+      - CONFIG_STORAGE_TOPIC=my_connect_configs
+      - OFFSET_STORAGE_TOPIC=my_connect_offsets
+      - STATUS_STORAGE_TOPIC=my_connect_statuses
+      - KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+    volumes:
+      - ./plugins/iceberg-kafka-connect:/kafka/connect/iceberg-kafka-connect
+      - ./plugins/sink-snowflake:/kafka/connect/sink-snowflake
+      - ./plugins/confluent-avro-converter:/kafka/connect/confluent-avro-converter
+
+  # ==========================================
+  # POSTGRES DE TESTE — origem do source-postgresql
+  # ==========================================
+  postgres-test:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=testdb
+    # wal_level=logical direto na inicialização — evita o passo manual de
+    # ALTER SYSTEM + restart do container pra habilitar replicação lógica.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+    volumes:
+      - ./data/postgres_test:/var/lib/postgresql/data

@@ -1,0 +1,27 @@
+# Credenciais/config local — nunca comitar (use .env.example como modelo)
+.env
+.env.*.local
+
+# Binário compilado — `go build ./...` sem -o gera isso na raiz do módulo
+/source-postgresql
+/source-postgresql.exe
+*.exe
+*.dll
+*.test
+*.out
+
+# Cobertura de testes
+coverage.out
+*.prof
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+
+# SO
+.DS_Store
+Thumbs.db
+
+# Dependências vendorizadas (não usamos vendor/, mas por segurança)
+/vendor/
