@@ -169,12 +169,12 @@ delete (testa o streaming de CDC).
 | `SLOT_LAG_WARN_BYTES` | não | Plain | Default `512MB`. Acima disso, loga warning + métrica de WAL retido |
 | `VIEW_REFRESH_INTERVAL_SECONDS` | não | Plain | Default `0` (só o snapshot inicial). Intervalo de re-snapshot de views |
 
-`KAFKA_BROKERS` também pode ser resolvido automaticamente pela plataforma se
-a pipeline usar uma conexão cadastrada em **Kafka → Conexões** — nesse caso a
-variável `INTHUB_KAFKA_CONNECTION` (ou `INTHUB_KAFKA_CONNECTION_N{n}` para um
-node Kafka específico) já entrega o endereço resolvido, sem precisar
-declarar `KAFKA_BROKERS` manualmente. Ajuste conforme o que fizer mais
-sentido no seu ambiente.
+Se a pipeline usar uma conexão cadastrada em **Kafka → Conexões** em vez de
+um endereço digitado à mão, a plataforma injeta o endereço resolvido em
+`INTHUB_KAFKA_CONNECTION` — o código já trata isso: `KAFKA_BROKERS` tem
+prioridade se estiver setada, caindo para `INTHUB_KAFKA_CONNECTION`
+automaticamente quando não estiver (função `resolveKafkaBrokers` em
+`process.go`). Não precisa declarar as duas.
 
 ## Formato da mensagem publicada
 
