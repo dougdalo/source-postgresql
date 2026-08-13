@@ -89,7 +89,17 @@ type sourceConfig struct {
 	OutputTopic  string
 	StateTopic   string
 
-	PGConnString string
+	// Conexão com o Postgres montada a partir de campos separados, não de um
+	// PG_DSN único: host/porta/banco/sslmode são variáveis plain, usuário e
+	// senha vêm de Secret — mesmo padrão já usado nos outros nodes Go
+	// Function da empresa (host/porta plain, credencial via secret).
+	PGHost     string
+	PGPort     string
+	PGDatabase string
+	PGUser     string
+	PGPassword string
+	PGSSLMode  string
+
 	SourceTables []string
 
 	SlotName        string
@@ -122,7 +132,12 @@ func loadSourceConfig() (*sourceConfig, error) {
 		KafkaBrokers:         resolveKafkaBrokers(),
 		OutputTopic:          os.Getenv("OUTPUT_TOPIC"),
 		StateTopic:           os.Getenv("STATE_TOPIC"),
-		PGConnString:         os.Getenv("PG_DSN"),
+		PGHost:               strings.TrimSpace(os.Getenv("PG_HOST")),
+		PGPort:               envOrDefault("PG_PORT", "5432"),
+		PGDatabase:           strings.TrimSpace(os.Getenv("PG_DATABASE")),
+		PGUser:               strings.TrimSpace(os.Getenv("PG_USER")),
+		PGPassword:           os.Getenv("PG_PASSWORD"),
+		PGSSLMode:            envOrDefault("PG_SSLMODE", "require"),
 		SourceTables:         splitCSV(os.Getenv("SOURCE_TABLES")),
 		SlotName:             os.Getenv("SLOT_NAME"),
 		PublicationName:      os.Getenv("PUBLICATION_NAME"),
@@ -149,8 +164,14 @@ func loadSourceConfig() (*sourceConfig, error) {
 		return nil, fmt.Errorf("KAFKA_BROKERS (ou INTHUB_KAFKA_CONNECTION) é obrigatório")
 	case cfg.OutputTopic == "":
 		return nil, fmt.Errorf("OUTPUT_TOPIC é obrigatório")
-	case cfg.PGConnString == "":
-		return nil, fmt.Errorf("PG_DSN é obrigatório")
+	case cfg.PGHost == "":
+		return nil, fmt.Errorf("PG_HOST é obrigatório")
+	case cfg.PGDatabase == "":
+		return nil, fmt.Errorf("PG_DATABASE é obrigatório")
+	case cfg.PGUser == "":
+		return nil, fmt.Errorf("PG_USER é obrigatório")
+	case cfg.PGPassword == "":
+		return nil, fmt.Errorf("PG_PASSWORD é obrigatório (configure como Secret)")
 	case len(cfg.SourceTables) == 0:
 		return nil, fmt.Errorf("SOURCE_TABLES é obrigatório (lista schema.tabela separada por vírgula)")
 	case cfg.SlotName == "":
@@ -201,6 +222,30 @@ func envInt64(key string, def int64) int64 {
 		}
 	}
 	return def
+}
+
+func envOrDefault(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+
+// buildPGConnString monta a connection string do Postgres a partir dos
+// campos separados (host/porta/banco plain, usuário/senha secret) — usuário
+// e senha passam por url.UserPassword pra escapar corretamente caracteres
+// especiais (@, :, /, etc.) que apareçam na senha.
+func buildPGConnString(cfg *sourceConfig) string {
+	u := url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(cfg.PGUser, cfg.PGPassword),
+		Host:   fmt.Sprintf("%s:%s", cfg.PGHost, cfg.PGPort),
+		Path:   "/" + cfg.PGDatabase,
+	}
+	q := u.Query()
+	q.Set("sslmode", cfg.PGSSLMode)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // =============================================================================
@@ -601,7 +646,7 @@ func ensureReplicationSlot(ctx context.Context, pool *pgxpool.Pool, replConn *pg
 func replicationConnString(dsn string) (string, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return "", fmt.Errorf("PG_DSN inválido: %w", err)
+		return "", fmt.Errorf("connection string do Postgres inválida: %w", err)
 	}
 	q := u.Query()
 	q.Set("replication", "database")
@@ -1312,7 +1357,8 @@ func runPipelineOnce(ctx context.Context, log *zap.Logger) error {
 		return err
 	}
 
-	poolConfig, err := pgxpool.ParseConfig(cfg.PGConnString)
+	pgConnString := buildPGConnString(cfg)
+	poolConfig, err := pgxpool.ParseConfig(pgConnString)
 	if err != nil {
 		return err
 	}
@@ -1361,7 +1407,7 @@ func runPipelineOnce(ctx context.Context, log *zap.Logger) error {
 	}
 	defer producer.Close() //nolint:errcheck
 
-	replConnString, err := replicationConnString(cfg.PGConnString)
+	replConnString, err := replicationConnString(pgConnString)
 	if err != nil {
 		return err
 	}
