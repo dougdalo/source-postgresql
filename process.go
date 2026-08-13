@@ -119,7 +119,7 @@ func loadSourceConfig() (*sourceConfig, error) {
 	snapshotWorkers := envInt("SNAPSHOT_WORKERS", 4)
 
 	cfg := &sourceConfig{
-		KafkaBrokers:         splitCSV(os.Getenv("KAFKA_BROKERS")),
+		KafkaBrokers:         resolveKafkaBrokers(),
 		OutputTopic:          os.Getenv("OUTPUT_TOPIC"),
 		StateTopic:           os.Getenv("STATE_TOPIC"),
 		PGConnString:         os.Getenv("PG_DSN"),
@@ -146,7 +146,7 @@ func loadSourceConfig() (*sourceConfig, error) {
 
 	switch {
 	case len(cfg.KafkaBrokers) == 0:
-		return nil, fmt.Errorf("KAFKA_BROKERS é obrigatório")
+		return nil, fmt.Errorf("KAFKA_BROKERS (ou INTHUB_KAFKA_CONNECTION) é obrigatório")
 	case cfg.OutputTopic == "":
 		return nil, fmt.Errorf("OUTPUT_TOPIC é obrigatório")
 	case cfg.PGConnString == "":
@@ -157,6 +157,18 @@ func loadSourceConfig() (*sourceConfig, error) {
 		return nil, fmt.Errorf("SLOT_NAME é obrigatório (precisa ser único por node/deploy)")
 	}
 	return cfg, nil
+}
+
+// resolveKafkaBrokers prioriza KAFKA_BROKERS (declarada explicitamente como
+// variável plain) e cai para INTHUB_KAFKA_CONNECTION se ela não estiver
+// setada — é a variável que a InthHub injeta automaticamente quando a
+// pipeline usa uma conexão cadastrada em Kafka → Conexões em vez de um valor
+// digitado à mão (ver "Conexões Kafka por cluster" na doc de deploy).
+func resolveKafkaBrokers() []string {
+	if brokers := splitCSV(os.Getenv("KAFKA_BROKERS")); len(brokers) > 0 {
+		return brokers
+	}
+	return splitCSV(os.Getenv("INTHUB_KAFKA_CONNECTION"))
 }
 
 func splitCSV(s string) []string {
@@ -1259,14 +1271,14 @@ var pipelineOnce sync.Once
 // começar. Esse node não tem trabalho de negócio disparado por mensagem — a
 // pipeline inteira (bootstrap do slot, snapshot inicial, streaming de CDC,
 // monitor) é iniciada aqui em background e roda até o processo morrer.
-func initVars() {
+func initVars(ctx context.Context, log *zap.Logger) error {
 	pipelineOnce.Do(func() {
-		log, err := zap.NewProduction()
-		if err != nil {
-			panic(err)
-		}
+		// Usa um context próprio, não o recebido aqui: o ctx de initVars pode
+		// ter escopo só da inicialização, e a pipeline precisa sobreviver por
+		// todo o tempo de vida do processo, não só até initVars retornar.
 		go runPipelineForever(context.Background(), log)
 	})
+	return nil
 }
 
 // runPipelineForever faz bootstrap + streaming, e se cair por erro (conexão
