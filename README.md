@@ -65,31 +65,64 @@ pelo `main.go` gerado.
 
 Na plataforma, o `main.go` é **fixo e não pode ser alterado** — só é possível
 mexer no `process.go` e nas variáveis de ambiente do deploy. É exatamente
-assim que este projeto foi desenhado:
+assim que este projeto foi desenhado, e o contrato abaixo já foi conferido
+contra a documentação oficial (guias *Pipelines*, *Criar uma pipeline*,
+*Publicar uma pipeline*, *Gerenciar secrets* e *Secrets externos*):
 
 - `process.go` **não sobe HTTP server, não abre porta, não faz nada de
   infraestrutura** — isso tudo (`/healthz`, `/metrics`, porta) já vem pronto
   do `main.go` padrão da plataforma.
-- Ele só declara duas funções que o `main.go` padrão espera encontrar:
-  `func initVars()` e
-  `func process(topicName, value, key string, headers map[string]string, log *zap.Logger) ([]ProcessResult, error)`.
+- Ele declara as duas funções que o `main.go` padrão exige, com a assinatura
+  confirmada no exemplo oficial de Go Function:
+  ```go
+  func initVars(ctx context.Context, log *zap.Logger) error
+  func process(topicName, value, key string, headers map[string]string, log *zap.Logger) ([]ProcessResult, error)
+  ```
   Todo o resto (config, catálogo do Postgres, publication/slot, snapshot,
   streaming, monitor) são funções privadas do próprio arquivo — não
   interferem em nada fora dele.
-- Toda a configuração vem de `os.Getenv` dentro do `process.go` — as
-  variáveis declaradas no deploy da plataforma chegam do jeito normal, sem
-  precisar de `.env` nem de nenhum arquivo. Basta declarar as variáveis da
-  seção [Variáveis de ambiente](#variáveis-de-ambiente): as 5 obrigatórias
-  (`KAFKA_BROKERS`, `OUTPUT_TOPIC`, `PG_DSN`, `SOURCE_TABLES`, `SLOT_NAME`)
-  e, se necessário, as de tuning.
+- Toda a configuração vem de `os.Getenv` dentro do `process.go`. As
+  variáveis são declaradas na aba **Deploy → Variáveis** da pipeline, cada
+  uma como **Valor plain** (host, porta, nome de tabela — nada sensível) ou
+  **Secret** (aponta para um Secret cadastrado em *Workspace → Secrets* + o
+  nome do campo dentro dele). `PG_DSN` deve ser Secret, já que carrega
+  usuário e senha do Postgres — veja
+  [Variáveis de ambiente](#variáveis-de-ambiente).
 
-> **Ponto de atenção:** a assinatura exata de `initVars()`/`process()` no
-> `process.go` precisa bater com o que o `main.go` real da plataforma chama.
-> O que está aqui é a melhor leitura da documentação disponível no momento em
-> que este projeto foi escrito — se o build da plataforma reclamar de
-> assinatura (`does not implement`, número de argumentos, etc.), ajuste
-> apenas essas duas funções no fim do `process.go`; o resto do arquivo não
-> muda.
+### Um Go Function precisa de pelo menos um Input ligado
+
+Este é o ponto que **não é óbvio de início**: a documentação de *Pipelines*
+é explícita — *"um Transform ou um Output consomem sempre de pelo menos um
+tópico. Sem isso, a publicação é recusada."* Um Go Function é sempre da
+família **Transform**, e a plataforma bloqueia a publicação de qualquer
+Transform sem nenhum Input conectado.
+
+Isso importa aqui porque este node não tem, por natureza, uma mensagem de
+negócio disparando o trabalho — a captura roda em background a partir do
+`initVars()`, direto do Postgres. Para a pipeline passar na validação da
+plataforma, conecte um **Input do tipo Cron** (baixa frequência, ex: a cada
+1-5 minutos) na entrada deste Go Function — o conteúdo do tick é irrelevante
+e ignorado por `process()` (que já devolve `nil, nil` sempre); ele só existe
+para satisfazer a exigência de "todo Transform tem um Input". O trabalho de
+verdade continua 100% dirigido pelo `initVars()`.
+
+### O tópico de saída é criado pela plataforma, não por você
+
+Segundo a documentação de *Pipelines*: *"Toda peça capaz de produzir dado —
+Input ou Transform — ganha automaticamente o seu tópico de saída quando é
+criada."* Ou seja, `OUTPUT_TOPIC` não é um nome que você inventa e declara à
+mão — a plataforma cria o tópico (padrão
+`{pipeline}-n{número-do-node}-{sufixo}`) e injeta o valor no ambiente do
+node sozinha. `STATE_TOPIC`, por outro lado, **não existe nesse mecanismo**
+— é uma criação própria deste projeto para guardar o checkpoint, então
+precisa ser criado manualmente (compactado) e declarado como variável plain
+apontando pro nome escolhido.
+
+> **Ponto de atenção:** o que está documentado aqui é a melhor leitura
+> possível da documentação oficial disponível no momento em que este
+> projeto foi escrito. Se o comportamento real da plataforma divergir em
+> algum detalhe (nome exato de alguma variável injetada automaticamente,
+> por exemplo), ajuste conforme o erro que a plataforma reportar no deploy.
 
 O `main.go`, `.env`/`.env.example`, `docker-compose.homelab.yaml` e a pasta
 `testdata/` deste repositório **não vão para a plataforma** — são apenas
@@ -117,24 +150,31 @@ delete (testa o streaming de CDC).
 
 ## Variáveis de ambiente
 
-| Var | Obrigatória | Descrição |
-|---|---|---|
-| `KAFKA_BROKERS` | sim | Lista separada por vírgula |
-| `OUTPUT_TOPIC` | sim | Tópico de dados |
-| `STATE_TOPIC` | não | Default `{OUTPUT_TOPIC}-state`. **Precisa ser criado com `cleanup.policy=compact`** — é onde o node guarda o checkpoint (LSN confirmado + progresso do snapshot por tabela) para sobreviver a restarts |
-| `PG_DSN` | sim | Connection string do Postgres, formato URL (`postgres://user:pass@host:5432/db?sslmode=require`) |
-| `SOURCE_TABLES` | sim | Lista `schema.tabela` separada por vírgula. Tipo de cada objeto (tabela/view/particionada) é descoberto em runtime |
-| `SLOT_NAME` | sim | Nome do replication slot — **único por deploy/instância do node**, senão dois nodes competem pelo mesmo slot |
-| `PUBLICATION_NAME` | não | Default = `SLOT_NAME` |
-| `SNAPSHOT_FETCH_SIZE` | não | Default `5000`. Tamanho do lote de paginação do snapshot |
-| `SNAPSHOT_WORKERS` | não | Default `4`. Partições-filha lidas em paralelo no snapshot inicial de uma tabela particionada |
-| `PG_POOL_MAX_CONNS` | não | Default `SNAPSHOT_WORKERS + 6`. Tamanho do pool de conexões do Postgres |
-| `KAFKA_BATCH_SIZE` | não | Default `1000`. Linhas por lote no producer Kafka |
-| `KAFKA_BATCH_BYTES` | não | Default `5MB`. Bytes por lote no producer Kafka |
-| `STATUS_UPDATE_INTERVAL_SECONDS` | não | Default `10`. Frequência do feedback ao Postgres (avança `confirmed_flush_lsn`, o que permite reciclar WAL) |
-| `SLOT_MONITOR_INTERVAL_SECONDS` | não | Default `30`. Frequência da checagem de lag do slot |
-| `SLOT_LAG_WARN_BYTES` | não | Default `512MB`. Acima disso, loga warning + métrica de WAL retido |
-| `VIEW_REFRESH_INTERVAL_SECONDS` | não | Default `0` (só o snapshot inicial). Intervalo de re-snapshot de views |
+| Var | Obrigatória | Fonte na InthHub | Descrição |
+|---|---|---|---|
+| `KAFKA_BROKERS` | sim | Plain (ou `INTHUB_KAFKA_CONNECTION`, se usar Kafka → Conexões) | Lista separada por vírgula |
+| `OUTPUT_TOPIC` | sim | **Auto-injetada pela plataforma** | Tópico de dados — não invente o nome, a plataforma cria e injeta ao criar o node |
+| `STATE_TOPIC` | não | Plain | Default `{OUTPUT_TOPIC}-state`. **Precisa ser criado manualmente com `cleanup.policy=compact`** (não é um tópico auto-gerenciado pela plataforma) — é onde o node guarda o checkpoint (LSN confirmado + progresso do snapshot por tabela) para sobreviver a restarts |
+| `PG_DSN` | sim | **Secret** | Connection string do Postgres, formato URL (`postgres://user:pass@host:5432/db?sslmode=require`) — contém credencial, nunca declare como plain |
+| `SOURCE_TABLES` | sim | Plain | Lista `schema.tabela` separada por vírgula. Tipo de cada objeto (tabela/view/particionada) é descoberto em runtime |
+| `SLOT_NAME` | sim | Plain | Nome do replication slot — **único por deploy/instância do node**, senão dois nodes competem pelo mesmo slot |
+| `PUBLICATION_NAME` | não | Plain | Default = `SLOT_NAME` |
+| `SNAPSHOT_FETCH_SIZE` | não | Plain | Default `5000`. Tamanho do lote de paginação do snapshot |
+| `SNAPSHOT_WORKERS` | não | Plain | Default `4`. Partições-filha lidas em paralelo no snapshot inicial de uma tabela particionada |
+| `PG_POOL_MAX_CONNS` | não | Plain | Default `SNAPSHOT_WORKERS + 6`. Tamanho do pool de conexões do Postgres |
+| `KAFKA_BATCH_SIZE` | não | Plain | Default `1000`. Linhas por lote no producer Kafka |
+| `KAFKA_BATCH_BYTES` | não | Plain | Default `5MB`. Bytes por lote no producer Kafka |
+| `STATUS_UPDATE_INTERVAL_SECONDS` | não | Plain | Default `10`. Frequência do feedback ao Postgres (avança `confirmed_flush_lsn`, o que permite reciclar WAL) |
+| `SLOT_MONITOR_INTERVAL_SECONDS` | não | Plain | Default `30`. Frequência da checagem de lag do slot |
+| `SLOT_LAG_WARN_BYTES` | não | Plain | Default `512MB`. Acima disso, loga warning + métrica de WAL retido |
+| `VIEW_REFRESH_INTERVAL_SECONDS` | não | Plain | Default `0` (só o snapshot inicial). Intervalo de re-snapshot de views |
+
+`KAFKA_BROKERS` também pode ser resolvido automaticamente pela plataforma se
+a pipeline usar uma conexão cadastrada em **Kafka → Conexões** — nesse caso a
+variável `INTHUB_KAFKA_CONNECTION` (ou `INTHUB_KAFKA_CONNECTION_N{n}` para um
+node Kafka específico) já entrega o endereço resolvido, sem precisar
+declarar `KAFKA_BROKERS` manualmente. Ajuste conforme o que fizer mais
+sentido no seu ambiente.
 
 ## Formato da mensagem publicada
 

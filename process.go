@@ -1259,14 +1259,14 @@ var pipelineOnce sync.Once
 // começar. Esse node não tem trabalho de negócio disparado por mensagem — a
 // pipeline inteira (bootstrap do slot, snapshot inicial, streaming de CDC,
 // monitor) é iniciada aqui em background e roda até o processo morrer.
-func initVars() {
+func initVars(ctx context.Context, log *zap.Logger) error {
 	pipelineOnce.Do(func() {
-		log, err := zap.NewProduction()
-		if err != nil {
-			panic(err)
-		}
+		// Usa um context próprio, não o recebido aqui: o ctx de initVars pode
+		// ter escopo só da inicialização, e a pipeline precisa sobreviver por
+		// todo o tempo de vida do processo, não só até initVars retornar.
 		go runPipelineForever(context.Background(), log)
 	})
+	return nil
 }
 
 // runPipelineForever faz bootstrap + streaming, e se cair por erro (conexão

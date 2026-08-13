@@ -81,10 +81,12 @@ func main() {
 	}
 	defer log.Sync() //nolint:errcheck
 
-	initVars()
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if err := initVars(ctx, log); err != nil {
+		log.Fatal("initVars falhou", zap.Error(err))
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
