@@ -85,9 +85,10 @@ contra a documentação oficial (guias *Pipelines*, *Criar uma pipeline*,
   variáveis são declaradas na aba **Deploy → Variáveis** da pipeline, cada
   uma como **Valor plain** (host, porta, nome de tabela — nada sensível) ou
   **Secret** (aponta para um Secret cadastrado em *Workspace → Secrets* + o
-  nome do campo dentro dele). `PG_DSN` deve ser Secret, já que carrega
-  usuário e senha do Postgres — veja
-  [Variáveis de ambiente](#variáveis-de-ambiente).
+  nome do campo dentro dele). A conexão com o Postgres segue o mesmo padrão
+  usado nos outros nodes Go Function da empresa: `PG_HOST`/`PG_PORT`/
+  `PG_DATABASE`/`PG_SSLMODE` como plain, e `PG_USER`/`PG_PASSWORD` como
+  Secret — veja [Variáveis de ambiente](#variáveis-de-ambiente).
 
 ### Um Go Function precisa de pelo menos um Input ligado
 
@@ -155,7 +156,12 @@ delete (testa o streaming de CDC).
 | `KAFKA_BROKERS` | sim | Plain (ou `INTHUB_KAFKA_CONNECTION`, se usar Kafka → Conexões) | Lista separada por vírgula |
 | `OUTPUT_TOPIC` | sim | **Auto-injetada pela plataforma** | Tópico de dados — não invente o nome, a plataforma cria e injeta ao criar o node |
 | `STATE_TOPIC` | não | Plain | Default `{OUTPUT_TOPIC}-state`. **Precisa ser criado manualmente com `cleanup.policy=compact`** (não é um tópico auto-gerenciado pela plataforma) — é onde o node guarda o checkpoint (LSN confirmado + progresso do snapshot por tabela) para sobreviver a restarts |
-| `PG_DSN` | sim | **Secret** | Connection string do Postgres, formato URL (`postgres://user:pass@host:5432/db?sslmode=require`) — contém credencial, nunca declare como plain |
+| `PG_HOST` | sim | Plain | Host do Postgres |
+| `PG_PORT` | não | Plain | Default `5432` |
+| `PG_DATABASE` | sim | Plain | Nome do banco |
+| `PG_SSLMODE` | não | Plain | Default `require`. Use `disable` só em ambiente de teste sem TLS |
+| `PG_USER` | sim | **Secret** | Usuário do Postgres |
+| `PG_PASSWORD` | sim | **Secret** | Senha do Postgres — nunca declare como plain |
 | `SOURCE_TABLES` | sim | Plain | Lista `schema.tabela` separada por vírgula. Tipo de cada objeto (tabela/view/particionada) é descoberto em runtime |
 | `SLOT_NAME` | sim | Plain | Nome do replication slot — **único por deploy/instância do node**, senão dois nodes competem pelo mesmo slot |
 | `PUBLICATION_NAME` | não | Plain | Default = `SLOT_NAME` |
@@ -271,7 +277,7 @@ a parte pesada de carregar um volume grande de dados de uma vez.
 
 ## Permissões necessárias no Postgres
 
-O usuário de `PG_DSN` precisa de:
+O usuário configurado em `PG_USER`/`PG_PASSWORD` precisa de:
 
 ```sql
 ALTER ROLE meu_usuario REPLICATION;
