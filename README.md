@@ -277,29 +277,39 @@ a parte pesada de carregar um volume grande de dados de uma vez.
 
 ## Permissões necessárias no Postgres
 
-O usuário configurado em `PG_USER`/`PG_PASSWORD` precisa de:
+O servidor precisa estar com `wal_level = logical` (requer restart se
+estiver como `replica`/`minimal`). O usuário configurado em
+`PG_USER`/`PG_PASSWORD` precisa das permissões abaixo — **o conjunto muda
+dependendo se o objeto é tabela normal/view ou tabela particionada**, então
+as duas situações estão separadas.
+
+### Checklist — tabela normal ou view
 
 ```sql
 ALTER ROLE meu_usuario REPLICATION;
-GRANT SELECT ON <tabelas e views listadas em SOURCE_TABLES> TO meu_usuario;
+GRANT SELECT ON schema.tabela_normal TO meu_usuario;
+GRANT SELECT ON schema.minha_view TO meu_usuario;
 ```
 
-O Postgres precisa estar com `wal_level = logical` (requer restart do
-servidor se estiver como `replica`/`minimal`).
+- `REPLICATION`: exigido pra abrir a conexão de replicação lógica (streaming de CDC) e criar/gerenciar o slot.
+- `SELECT` na própria tabela/view: exigido pro snapshot inicial, que faz `SELECT * FROM schema.tabela_normal` direto.
+- A tabela precisa ter **chave primária** — usada tanto pra key das mensagens quanto porque replicação lógica exige `REPLICA IDENTITY DEFAULT` (usa a PK) ou `FULL` no mínimo. Sem PK, o node recusa subir. Views não precisam de PK (não têm CDC, só snapshot).
 
-### Tabela particionada: o GRANT na raiz não basta
+### Checklist — tabela particionada (`PARTITION BY`)
 
-Isso pegou gente de surpresa em produção, então vale destacar: o
-[snapshot paralelo por partição](#tuning-de-produção-tabelas-grandes) lê
-**cada partição diretamente pelo nome** (`SELECT * FROM
-tabela_2025_04 ...`), não através da tabela-raiz — é assim que ele
-paraleliza. Quando a consulta nomeia a partição diretamente, o Postgres
-checa a permissão **daquela partição**, não da raiz, e uma partição nova
-**não herda automaticamente** o `GRANT` dado na raiz.
+O ponto que costuma pegar gente de surpresa: **o `GRANT` na tabela-raiz não
+é suficiente, e também não é o que falta** — são coisas diferentes.
 
-Sem isso, o snapshot falha assim (o streaming de CDC não é afetado — ele lê
-do WAL, não faz `SELECT`, só precisa de `REPLICATION` e a tabela estar na
-publication):
+| Onde dar o GRANT | Precisa? | Por quê |
+|---|---|---|
+| `SELECT` na tabela-**raiz** (`schema.tabela_particionada`) | **Não precisa** | O código nunca faz `SELECT` direto na raiz — nem o snapshot nem o CDC leem por ali |
+| `SELECT` em **cada partição-filha** (`schema.tabela_particionada_2025_04`, etc.) | **Precisa, uma por uma** | O [snapshot paralelo por partição](#tuning-de-produção-tabelas-grandes) lê cada partição diretamente pelo nome físico (`SELECT * FROM tabela_particionada_2025_04 ...`), pra poder paralelizar. Quando a consulta nomeia a partição diretamente, o Postgres checa a permissão **daquela partição**, não da raiz — e uma partição nova **não herda automaticamente** nenhum `GRANT` dado na raiz |
+| `REPLICATION` no usuário | Precisa (igual tabela normal) | Streaming de CDC |
+| Chave primária na raiz, incluindo a coluna de partição | Precisa (exigência do próprio Postgres pra tabela particionada) | Postgres propaga a constraint pra cada partição automaticamente — não precisa recriar PK partição por partição |
+| Ser dono da publication, **se ela já existir criada por fora** (ex: por um DBA) | Só se o node precisar adicionar a tabela numa publication pré-existente | Ver aviso abaixo |
+
+Sem o `SELECT` em cada partição, o snapshot falha assim (o streaming de CDC
+**não** é afetado por isso — ele lê do WAL, não faz `SELECT`):
 
 ```
 ERROR: permission denied for table sicsimulacao_2025_04 (SQLSTATE 42501)
@@ -326,10 +336,15 @@ Sem o passo 2, toda vez que uma partição nova for criada (mensal, por
 exemplo) o snapshot dela volta a falhar até alguém lembrar de rodar o
 `GRANT` de novo.
 
-Toda tabela em `SOURCE_TABLES` precisa ter **chave primária** — usada tanto
-para a key das mensagens quanto porque replicação lógica exige
-`REPLICA IDENTITY DEFAULT` (usa a PK) ou `FULL` no mínimo. Sem PK, o node
-recusa subir.
+> **Publication pré-existente (criada por fora, ex: por um DBA):** o node
+> tenta automaticamente incluir a tabela na publication se ela ainda não
+> for membro (`ALTER PUBLICATION ... ADD TABLE`), e isso **exige ser dono
+> da publication** — só dá erro se a tabela genuinamente ainda não estiver
+> lá. Se a publication já foi criada cobrindo sua tabela (direto ou via
+> `FOR TABLE`), o node detecta isso e não tenta alterar nada, não
+> precisando de posse da publication nesse caso.
+
+### Coluna TOAST grande
 
 Se alguma coluna TOAST grande (texto/bytea grande) precisar sempre vir
 completa em updates que não a alteraram, configure `REPLICA IDENTITY FULL`
