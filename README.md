@@ -12,18 +12,25 @@ tudo em um tópico Kafka. Construído como um node da plataforma **InthHub**.
 
 ## Sumário
 
-- [Visão geral](#visão-geral)
-- [Arquitetura do node](#arquitetura-do-node)
-- [Deploy na InthHub](#deploy-na-inthhub)
-- [Rodando localmente](#rodando-localmente)
-- [Variáveis de ambiente](#variáveis-de-ambiente)
-- [Formato da mensagem publicada](#formato-da-mensagem-publicada)
-- [Como funciona o bootstrap](#como-funciona-o-bootstrap-primeira-execução)
-- [Tuning de produção](#tuning-de-produção-tabelas-grandes)
-- [Permissões necessárias no Postgres](#permissões-necessárias-no-postgres)
-- [Reciclagem do slot / monitoramento](#reciclagem-do-slot--monitoramento)
-- [Resiliência](#resiliência)
-- [Licença](#licença)
+- [source-postgresql](#source-postgresql)
+  - [Sumário](#sumário)
+  - [Visão geral](#visão-geral)
+  - [Arquitetura do node](#arquitetura-do-node)
+  - [Deploy na InthHub](#deploy-na-inthhub)
+    - [Um Go Function precisa de pelo menos um Input ligado](#um-go-function-precisa-de-pelo-menos-um-input-ligado)
+    - [O tópico de saída é criado pela plataforma, não por você](#o-tópico-de-saída-é-criado-pela-plataforma-não-por-você)
+  - [Rodando localmente](#rodando-localmente)
+  - [Variáveis de ambiente](#variáveis-de-ambiente)
+  - [Formato da mensagem publicada](#formato-da-mensagem-publicada)
+  - [Como funciona o bootstrap (primeira execução)](#como-funciona-o-bootstrap-primeira-execução)
+  - [Tuning de produção (tabelas grandes)](#tuning-de-produção-tabelas-grandes)
+  - [Permissões necessárias no Postgres](#permissões-necessárias-no-postgres)
+    - [Checklist — tabela normal ou view](#checklist--tabela-normal-ou-view)
+    - [Checklist — tabela particionada (`PARTITION BY`)](#checklist--tabela-particionada-partition-by)
+    - [Coluna TOAST grande](#coluna-toast-grande)
+  - [Reciclagem do slot / monitoramento](#reciclagem-do-slot--monitoramento)
+  - [Resiliência](#resiliência)
+  - [Licença](#licença)
 
 ## Visão geral
 
