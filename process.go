@@ -126,7 +126,16 @@ type sourceConfig struct {
 	ViewRefreshInterval  time.Duration
 }
 
-func loadSourceConfig() (*sourceConfig, error) {
+// maxSnapshotWorkers é um teto absoluto pro paralelismo do snapshot inicial,
+// independente do que SNAPSHOT_WORKERS pedir. Existe pra cobrir o caso de
+// alguém setar o valor igual (ou perto) do número de partições de uma tabela
+// grande — ex.: 24 partições, SNAPSHOT_WORKERS=24 pra "processar tudo de uma
+// vez" — o que sobe memória rápido demais e derruba o pod com OOMKilled no
+// meio do bootstrap (cada worker segura um lote inteiro de linhas na
+// memória). Alinhado ao teto já documentado no README "Tuning de produção".
+const maxSnapshotWorkers = 12
+
+func loadSourceConfig(log *zap.Logger) (*sourceConfig, error) {
 	// Defaults conservadores de propósito: o pico de memória do snapshot
 	// escala com SnapshotWorkers × SnapshotFetchSize (cada worker segura um
 	// lote inteiro de linhas na memória). Sem saber de antemão o limite de
@@ -134,6 +143,11 @@ func loadSourceConfig() (*sourceConfig, error) {
 	// pelo deploy da pipeline), é mais seguro começar pequeno e deixar quem
 	// tiver folga de memória subir via env var do que estourar OOM por padrão.
 	snapshotWorkers := envInt("SNAPSHOT_WORKERS", 2)
+	if snapshotWorkers > maxSnapshotWorkers {
+		log.Warn("SNAPSHOT_WORKERS acima do teto de segurança, limitando",
+			zap.Int("solicitado", snapshotWorkers), zap.Int("teto", maxSnapshotWorkers))
+		snapshotWorkers = maxSnapshotWorkers
+	}
 
 	cfg := &sourceConfig{
 		KafkaBrokers:         resolveKafkaBrokers(),
@@ -1398,7 +1412,7 @@ func runPipelineForever(ctx context.Context, log *zap.Logger) {
 }
 
 func runPipelineOnce(ctx context.Context, log *zap.Logger) error {
-	cfg, err := loadSourceConfig()
+	cfg, err := loadSourceConfig(log)
 	if err != nil {
 		return err
 	}

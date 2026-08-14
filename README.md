@@ -173,7 +173,7 @@ delete (testa o streaming de CDC).
 | `SLOT_NAME` | sim | Plain | Nome do replication slot — **único por deploy/instância do node**, senão dois nodes competem pelo mesmo slot |
 | `PUBLICATION_NAME` | não | Plain | Default = `SLOT_NAME` |
 | `SNAPSHOT_FETCH_SIZE` | não | Plain | Default `1000`. Tamanho do lote de paginação do snapshot. Default conservador de propósito — cada worker mantém um lote inteiro na memória, então isso escala junto com `SNAPSHOT_WORKERS` (veja [Tuning](#tuning-de-produção-tabelas-grandes)) |
-| `SNAPSHOT_WORKERS` | não | Plain | Default `2`. Partições-filha lidas em paralelo no snapshot inicial de uma tabela particionada. Default conservador — só suba se o pod tiver folga de memória |
+| `SNAPSHOT_WORKERS` | não | Plain | Default `2`, teto absoluto `12` (valor acima disso é limitado e loga `warn`). Partições-filha lidas em paralelo no snapshot inicial de uma tabela particionada. Default conservador — só suba se o pod tiver folga de memória |
 | `PG_POOL_MAX_CONNS` | não | Plain | Default `SNAPSHOT_WORKERS + 6`. Tamanho do pool de conexões do Postgres |
 | `KAFKA_BATCH_SIZE` | não | Plain | Default `1000`. Linhas por lote no producer Kafka |
 | `KAFKA_BATCH_BYTES` | não | Plain | Default `5MB`. Bytes por lote no producer Kafka |
@@ -231,6 +231,14 @@ memória de sobra e a tabela for grande o suficiente pra o ganho de
 velocidade valer a pena. Pensado para cenários como "dezenas de milhões de
 linhas numa tabela particionada em várias partições, Kafka com vários
 brokers e boa capacidade de máquina":
+
+> `SNAPSHOT_WORKERS` tem um **teto absoluto de 12** aplicado no código,
+> independente do valor da env var — protege contra o caso de setar o
+> paralelismo igual (ou perto) do número de partições de uma tabela grande
+> (ex.: 24 partições, `SNAPSHOT_WORKERS=24` pra "processar tudo de uma vez"),
+> que sobe memória rápido demais e derruba o pod com `OOMKilled` no meio do
+> bootstrap. Valores acima do teto são limitados a 12, com um `warn` no log
+> avisando o clamp.
 
 **1. O snapshot lê partição por partição, em paralelo.** Para uma tabela
 `PARTITION BY`, o node descobre as partições-filha físicas (`pg_inherits`) e
