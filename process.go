@@ -546,6 +546,29 @@ func discoverPartitions(ctx context.Context, pool *pgxpool.Pool, root tableInfo)
 // Publication + replication slot.
 // =============================================================================
 
+// isTableInPublication checa a associação direto no catálogo (pg_publication_rel,
+// por OID via ::regclass) em vez da view pg_publication_tables. A view expande
+// tabela particionada em partições-folha ou na raiz dependendo da flag
+// publish_via_partition_root da publication — se uma publication pré-existente
+// (criada por fora, ex: por um DBA) não tiver essa flag, a view pode listar as
+// partições-folha em vez da tabela-raiz configurada em SOURCE_TABLES, dando um
+// falso "não está na publication" e disparando um ALTER desnecessário (que
+// falha se o usuário do app não for dono da publication). Checar por OID
+// direto no catálogo evita essa ambiguidade — é exatamente o que
+// CREATE/ALTER PUBLICATION ... FOR TABLE registra, sem expansão nenhuma.
+func isTableInPublication(ctx context.Context, pool *pgxpool.Pool, pubName, qualifiedTable string) (bool, error) {
+	var member bool
+	err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_publication_rel pr
+			JOIN pg_publication p ON p.oid = pr.prpubid
+			WHERE p.pubname = $1 AND pr.prrelid = $2::regclass
+		)
+	`, pubName, qualifiedTable).Scan(&member)
+	return member, err
+}
+
 // ensurePublication cria a publication se não existir e garante que todas as
 // tabelas CDC-capable estejam nela. publish_via_partition_root=true faz o
 // Postgres publicar mudanças de qualquer partição-folha como se fossem da
@@ -580,24 +603,13 @@ func ensurePublication(ctx context.Context, pool *pgxpool.Pool, pubName string, 
 		return nil
 	}
 
-	rows, err := pool.Query(ctx, `SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = $1`, pubName)
-	if err != nil {
-		return fmt.Errorf("listar tabelas da publication: %w", err)
-	}
-	current := map[string]bool{}
-	for rows.Next() {
-		var s, n string
-		if err := rows.Scan(&s, &n); err != nil {
-			rows.Close()
-			return err
-		}
-		current[s+"."+n] = true
-	}
-	rows.Close()
-
 	var missing []string
 	for _, t := range cdcTables {
-		if !current[t.qualified()] {
+		member, err := isTableInPublication(ctx, pool, pubName, t.qualified())
+		if err != nil {
+			return fmt.Errorf("checar se %s já está na publication: %w", t.qualified(), err)
+		}
+		if !member {
 			missing = append(missing, pgx.Identifier{t.Schema, t.Name}.Sanitize())
 		}
 	}
