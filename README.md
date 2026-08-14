@@ -172,8 +172,8 @@ delete (testa o streaming de CDC).
 | `SOURCE_TABLES` | sim | Plain | Lista `schema.tabela` separada por vírgula. Tipo de cada objeto (tabela/view/particionada) é descoberto em runtime |
 | `SLOT_NAME` | sim | Plain | Nome do replication slot — **único por deploy/instância do node**, senão dois nodes competem pelo mesmo slot |
 | `PUBLICATION_NAME` | não | Plain | Default = `SLOT_NAME` |
-| `SNAPSHOT_FETCH_SIZE` | não | Plain | Default `5000`. Tamanho do lote de paginação do snapshot |
-| `SNAPSHOT_WORKERS` | não | Plain | Default `4`. Partições-filha lidas em paralelo no snapshot inicial de uma tabela particionada |
+| `SNAPSHOT_FETCH_SIZE` | não | Plain | Default `1000`. Tamanho do lote de paginação do snapshot. Default conservador de propósito — cada worker mantém um lote inteiro na memória, então isso escala junto com `SNAPSHOT_WORKERS` (veja [Tuning](#tuning-de-produção-tabelas-grandes)) |
+| `SNAPSHOT_WORKERS` | não | Plain | Default `2`. Partições-filha lidas em paralelo no snapshot inicial de uma tabela particionada. Default conservador — só suba se o pod tiver folga de memória |
 | `PG_POOL_MAX_CONNS` | não | Plain | Default `SNAPSHOT_WORKERS + 6`. Tamanho do pool de conexões do Postgres |
 | `KAFKA_BATCH_SIZE` | não | Plain | Default `1000`. Linhas por lote no producer Kafka |
 | `KAFKA_BATCH_BYTES` | não | Plain | Default `5MB`. Bytes por lote no producer Kafka |
@@ -223,9 +223,14 @@ por chave primária, não do zero).
 
 ## Tuning de produção (tabelas grandes)
 
-Pensado para cenários como "dezenas de milhões de linhas numa tabela
-particionada em várias partições, Kafka com vários brokers e boa capacidade
-de máquina":
+Os defaults (`SNAPSHOT_WORKERS=2`, `SNAPSHOT_FETCH_SIZE=1000`) são
+propositalmente conservadores de memória — pensados pra rodar sem estourar
+limite em pods pequenos, mesmo sem controle sobre o `MEM REQ → LIM` do
+deploy. Esta seção é **opt-in**: só suba esses valores se o pod tiver
+memória de sobra e a tabela for grande o suficiente pra o ganho de
+velocidade valer a pena. Pensado para cenários como "dezenas de milhões de
+linhas numa tabela particionada em várias partições, Kafka com vários
+brokers e boa capacidade de máquina":
 
 **1. O snapshot lê partição por partição, em paralelo.** Para uma tabela
 `PARTITION BY`, o node descobre as partições-filha físicas (`pg_inherits`) e
@@ -249,8 +254,8 @@ antes de mandar para a rede, em vez de fazer um round-trip por linha.
 brokers de 32GB/8vCPU, tópico com 6 partições):
 
 ```dotenv
-SNAPSHOT_WORKERS=8          # entre 6 e 12; comece em 8 e observe carga no Postgres
-SNAPSHOT_FETCH_SIZE=20000   # lotes maiores = menos round-trips (default 5000 é conservador)
+SNAPSHOT_WORKERS=8          # entre 6 e 12; comece em 8 e observe carga no Postgres E memória do pod
+SNAPSHOT_FETCH_SIZE=20000   # lotes maiores = menos round-trips, mas mais memória por worker (default 1000 é o modo econômico)
 PG_POOL_MAX_CONNS=16        # SNAPSHOT_WORKERS + folga para monitor/refresh de views
 KAFKA_BATCH_SIZE=2000
 KAFKA_BATCH_BYTES=8388608   # 8MB — máquinas robustas de Kafka aguentam tranquilo
