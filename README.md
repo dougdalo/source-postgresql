@@ -287,6 +287,45 @@ GRANT SELECT ON <tabelas e views listadas em SOURCE_TABLES> TO meu_usuario;
 O Postgres precisa estar com `wal_level = logical` (requer restart do
 servidor se estiver como `replica`/`minimal`).
 
+### Tabela particionada: o GRANT na raiz não basta
+
+Isso pegou gente de surpresa em produção, então vale destacar: o
+[snapshot paralelo por partição](#tuning-de-produção-tabelas-grandes) lê
+**cada partição diretamente pelo nome** (`SELECT * FROM
+tabela_2025_04 ...`), não através da tabela-raiz — é assim que ele
+paraleliza. Quando a consulta nomeia a partição diretamente, o Postgres
+checa a permissão **daquela partição**, não da raiz, e uma partição nova
+**não herda automaticamente** o `GRANT` dado na raiz.
+
+Sem isso, o snapshot falha assim (o streaming de CDC não é afetado — ele lê
+do WAL, não faz `SELECT`, só precisa de `REPLICATION` e a tabela estar na
+publication):
+
+```
+ERROR: permission denied for table sicsimulacao_2025_04 (SQLSTATE 42501)
+```
+
+A correção tem duas partes — cobre as partições de hoje e as que ainda vão
+ser criadas:
+
+```sql
+-- 1. Partições que já existem
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO meu_usuario;
+
+-- 2. Partições futuras — roda como o role que normalmente CRIA as
+--    partições novas (rotina de manutenção de partição), senão o
+--    default privilege não pega
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO meu_usuario;
+
+-- Se quem cria as partições novas é outro role, especifique:
+-- ALTER DEFAULT PRIVILEGES FOR ROLE role_que_cria_particoes IN SCHEMA public
+--     GRANT SELECT ON TABLES TO meu_usuario;
+```
+
+Sem o passo 2, toda vez que uma partição nova for criada (mensal, por
+exemplo) o snapshot dela volta a falhar até alguém lembrar de rodar o
+`GRANT` de novo.
+
 Toda tabela em `SOURCE_TABLES` precisa ter **chave primária** — usada tanto
 para a key das mensagens quanto porque replicação lógica exige
 `REPLICA IDENTITY DEFAULT` (usa a PK) ou `FULL` no mínimo. Sem PK, o node
