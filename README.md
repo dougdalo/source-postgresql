@@ -319,7 +319,7 @@ Sem o `SELECT` em cada partição, o snapshot falha assim (o streaming de CDC
 **não** é afetado por isso — ele lê do WAL, não faz `SELECT`):
 
 ```
-ERROR: permission denied for table sicsimulacao_2025_04 (SQLSTATE 42501)
+ERROR: permission denied for table table_2025_04 (SQLSTATE 42501)
 ```
 
 A correção tem duas partes — cobre as partições de hoje e as que ainda vão
