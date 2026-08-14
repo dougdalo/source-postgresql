@@ -1084,6 +1084,16 @@ func (r *replicator) run(ctx context.Context, conn *pgconn.PgConn, st *pipelineS
 			if err != nil {
 				return fmt.Errorf("parsear keepalive: %w", err)
 			}
+			// ServerWALEnd é até onde o servidor já processou. Avança a
+			// posição mesmo sem XLogData: se não chegou Insert/Update/Delete
+			// é porque não havia nada relevante pra nossa publication nesse
+			// trecho (o pgoutput já filtra no servidor) — sem isso, tabelas
+			// com pouca escrita numa instância com outras tabelas ativas
+			// ficariam com o slot represando WAL de trechos que já foram
+			// processados e descartados como irrelevantes.
+			if pkm.ServerWALEnd > clientXLogPos {
+				clientXLogPos = pkm.ServerWALEnd
+			}
 			if pkm.ReplyRequested {
 				nextStandby = time.Time{}
 			}
