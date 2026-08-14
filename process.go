@@ -126,7 +126,13 @@ type sourceConfig struct {
 }
 
 func loadSourceConfig() (*sourceConfig, error) {
-	snapshotWorkers := envInt("SNAPSHOT_WORKERS", 4)
+	// Defaults conservadores de propósito: o pico de memória do snapshot
+	// escala com SnapshotWorkers × SnapshotFetchSize (cada worker segura um
+	// lote inteiro de linhas na memória). Sem saber de antemão o limite de
+	// memória do pod (em muitos ambientes ele é automático, não configurável
+	// pelo deploy da pipeline), é mais seguro começar pequeno e deixar quem
+	// tiver folga de memória subir via env var do que estourar OOM por padrão.
+	snapshotWorkers := envInt("SNAPSHOT_WORKERS", 2)
 
 	cfg := &sourceConfig{
 		KafkaBrokers:         resolveKafkaBrokers(),
@@ -141,7 +147,7 @@ func loadSourceConfig() (*sourceConfig, error) {
 		SourceTables:         splitCSV(os.Getenv("SOURCE_TABLES")),
 		SlotName:             os.Getenv("SLOT_NAME"),
 		PublicationName:      os.Getenv("PUBLICATION_NAME"),
-		SnapshotFetchSize:    envInt("SNAPSHOT_FETCH_SIZE", 5000),
+		SnapshotFetchSize:    envInt("SNAPSHOT_FETCH_SIZE", 1000),
 		SnapshotWorkers:      snapshotWorkers,
 		PGPoolMaxConns:       int32(envInt("PG_POOL_MAX_CONNS", snapshotWorkers+6)),
 		KafkaBatchSize:       envInt("KAFKA_BATCH_SIZE", 1000),
