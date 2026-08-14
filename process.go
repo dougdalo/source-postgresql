@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -278,10 +279,17 @@ func newEmptyState() *pipelineState {
 
 func loadState(ctx context.Context, brokers []string, topic string, log *zap.Logger) (*pipelineState, error) {
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:  brokers,
-		Topic:    topic,
-		MinBytes: 1,
-		MaxBytes: 10e6,
+		Brokers: brokers,
+		Topic:   topic,
+		// Sempre partição 0: saveState/stateWriter escreve sem balancer,
+		// forçando a mesma partição — se o tópico tiver mais de uma (comum
+		// se foi criado com o partition count default do cluster em vez de
+		// 1), ler sem fixar a partição pegaria só a 0 por padrão do kafka-go
+		// enquanto a escrita podia cair em qualquer uma via hash da key,
+		// fazendo o checkpoint nunca ser encontrado na releitura.
+		Partition: 0,
+		MinBytes:  1,
+		MaxBytes:  10e6,
 	})
 	defer reader.Close()
 
@@ -291,6 +299,9 @@ func loadState(ctx context.Context, brokers []string, topic string, log *zap.Log
 		msg, err := reader.ReadMessage(readCtx)
 		cancel()
 		if err != nil {
+			if !errors.Is(err, context.DeadlineExceeded) {
+				log.Warn("erro lendo checkpoint do STATE_TOPIC, seguindo com estado vazio (snapshot pode reiniciar do zero)", zap.Error(err))
+			}
 			break // timeout == chegamos no fim do tópico (ou ele está vazio)
 		}
 		applyStateRecord(state, msg)
@@ -315,6 +326,13 @@ func applyStateRecord(state *pipelineState, msg kafka.Message) {
 		*state = loaded
 	}
 }
+
+// singlePartitionBalancer força toda mensagem pra partição 0, sempre — é o
+// que garante que o checkpoint escrito bata com a partição 0 fixa que
+// loadState lê, não importa quantas partições o STATE_TOPIC realmente tenha.
+type singlePartitionBalancer struct{}
+
+func (singlePartitionBalancer) Balance(_ kafka.Message, _ ...int) int { return 0 }
 
 func saveState(ctx context.Context, writer *kafka.Writer, state *pipelineState) error {
 	state.UpdatedAt = time.Now().UTC()
@@ -1415,7 +1433,7 @@ func runPipelineOnce(ctx context.Context, log *zap.Logger) error {
 		return err
 	}
 
-	stateWriter := &kafka.Writer{Addr: kafka.TCP(cfg.KafkaBrokers...), Topic: cfg.StateTopic, Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll}
+	stateWriter := &kafka.Writer{Addr: kafka.TCP(cfg.KafkaBrokers...), Topic: cfg.StateTopic, Balancer: singlePartitionBalancer{}, RequiredAcks: kafka.RequireAll}
 	defer stateWriter.Close() //nolint:errcheck
 
 	st, err := loadState(ctx, cfg.KafkaBrokers, cfg.StateTopic, log)
