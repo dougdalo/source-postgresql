@@ -198,6 +198,17 @@ func loadSourceConfig(log *zap.Logger) (*sourceConfig, error) {
 	case cfg.SlotName == "":
 		return nil, fmt.Errorf("SLOT_NAME é obrigatório (precisa ser único por node/deploy)")
 	}
+
+	// Loga os knobs que mais pesam na memória do snapshot — sem isso, um OOM
+	// em produção não dá pra diagnosticar via log: os valores efetivos vêm de
+	// env vars do deploy (fora deste repo) e nunca aparecem em lugar nenhum.
+	log.Info("config efetiva de tuning carregada",
+		zap.Int("snapshot_workers", cfg.SnapshotWorkers),
+		zap.Int("snapshot_fetch_size", cfg.SnapshotFetchSize),
+		zap.Int32("pg_pool_max_conns", cfg.PGPoolMaxConns),
+		zap.Int("kafka_batch_size", cfg.KafkaBatchSize),
+		zap.Int64("kafka_batch_bytes", cfg.KafkaBatchBytes))
+
 	return cfg, nil
 }
 
