@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -135,6 +136,14 @@ type sourceConfig struct {
 // memória). Alinhado ao teto já documentado no README "Tuning de produção".
 const maxSnapshotWorkers = 12
 
+// maxSnapshotFetchSize é o teto absoluto de linhas por lote do snapshot,
+// pelo mesmo motivo do teto de workers: memória de pico escala com
+// SnapshotWorkers × SnapshotFetchSize × largura da linha, e nada limitava o
+// segundo fator até aqui. 20000 é o próprio valor de referência documentado
+// no README pra tabela grande com pod de sobra — acima disso já não é mais
+// tuning, é risco.
+const maxSnapshotFetchSize = 20000
+
 func loadSourceConfig(log *zap.Logger) (*sourceConfig, error) {
 	// Defaults conservadores de propósito: o pico de memória do snapshot
 	// escala com SnapshotWorkers × SnapshotFetchSize (cada worker segura um
@@ -147,6 +156,13 @@ func loadSourceConfig(log *zap.Logger) (*sourceConfig, error) {
 		log.Warn("SNAPSHOT_WORKERS acima do teto de segurança, limitando",
 			zap.Int("solicitado", snapshotWorkers), zap.Int("teto", maxSnapshotWorkers))
 		snapshotWorkers = maxSnapshotWorkers
+	}
+
+	snapshotFetchSize := envInt("SNAPSHOT_FETCH_SIZE", 1000)
+	if snapshotFetchSize > maxSnapshotFetchSize {
+		log.Warn("SNAPSHOT_FETCH_SIZE acima do teto de segurança, limitando",
+			zap.Int("solicitado", snapshotFetchSize), zap.Int("teto", maxSnapshotFetchSize))
+		snapshotFetchSize = maxSnapshotFetchSize
 	}
 
 	cfg := &sourceConfig{
@@ -162,7 +178,7 @@ func loadSourceConfig(log *zap.Logger) (*sourceConfig, error) {
 		SourceTables:         splitCSV(os.Getenv("SOURCE_TABLES")),
 		SlotName:             os.Getenv("SLOT_NAME"),
 		PublicationName:      os.Getenv("PUBLICATION_NAME"),
-		SnapshotFetchSize:    envInt("SNAPSHOT_FETCH_SIZE", 1000),
+		SnapshotFetchSize:    snapshotFetchSize,
 		SnapshotWorkers:      snapshotWorkers,
 		PGPoolMaxConns:       int32(envInt("PG_POOL_MAX_CONNS", snapshotWorkers+6)),
 		KafkaBatchSize:       envInt("KAFKA_BATCH_SIZE", 1000),
@@ -907,7 +923,13 @@ func snapshotUnit(ctx context.Context, pool *pgxpool.Pool, producer, stateWriter
 		if err != nil {
 			return 0, fmt.Errorf("query na view: %w", err)
 		}
-		var batch []map[string]any
+		// Sem PK não dá pra paginar por cursor como no caminho de cima, mas
+		// isso não significa segurar a view inteira em memória — publica em
+		// lotes de fetchSize conforme lê, do mesmo jeito que o caminho com PK
+		// faz. Sem isso, uma view grande estoura memória de um jeito que
+		// nenhum SNAPSHOT_WORKERS/SNAPSHOT_FETCH_SIZE consegue conter, porque
+		// o limite nunca era respeitado aqui pra começo de conversa.
+		batch := make([]map[string]any, 0, fetchSize)
 		for rows.Next() {
 			row, err := rowToMap(rows)
 			if err != nil {
@@ -915,17 +937,28 @@ func snapshotUnit(ctx context.Context, pool *pgxpool.Pool, producer, stateWriter
 				return rowCount, err
 			}
 			batch = append(batch, row)
+			if len(batch) >= fetchSize {
+				if err := publishRowsBatch(ctx, producer, publishAs, batch, nil, opSnapshot); err != nil {
+					rows.Close()
+					return rowCount, fmt.Errorf("publicar lote da view: %w", err)
+				}
+				rowCount += len(batch)
+				metricSnapshotRows.WithLabelValues(publishAs).Add(float64(len(batch)))
+				batch = batch[:0]
+			}
 		}
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
 			return rowCount, err
 		}
-		if err := publishRowsBatch(ctx, producer, publishAs, batch, nil, opSnapshot); err != nil {
-			return rowCount, fmt.Errorf("publicar linhas da view: %w", err)
+		if len(batch) > 0 {
+			if err := publishRowsBatch(ctx, producer, publishAs, batch, nil, opSnapshot); err != nil {
+				return rowCount, fmt.Errorf("publicar lote da view: %w", err)
+			}
+			rowCount += len(batch)
+			metricSnapshotRows.WithLabelValues(publishAs).Add(float64(len(batch)))
 		}
-		rowCount = len(batch)
-		metricSnapshotRows.WithLabelValues(publishAs).Add(float64(rowCount))
 		stateMu.Lock()
 		st.Snapshots[stateKey] = tableSnapshotState{Done: true}
 		stateMu.Unlock()
@@ -1015,7 +1048,7 @@ func extractKey(row map[string]any, pkCols []string) map[string]any {
 
 // refreshViews relê as views inteiras e republica, sem depender de checkpoint
 // (views não são paginadas por PK — cada ciclo é uma leitura completa nova).
-func refreshViews(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Writer, views []tableInfo, log *zap.Logger) error {
+func refreshViews(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Writer, views []tableInfo, fetchSize int, log *zap.Logger) error {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("adquirir conexão pro refresh de views: %w", err)
@@ -1034,7 +1067,11 @@ func refreshViews(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Write
 		if err != nil {
 			return fmt.Errorf("query na view %s: %w", v.qualified(), err)
 		}
-		var batch []map[string]any
+		// Mesmo raciocínio do snapshot inicial de view: publica em lotes de
+		// fetchSize conforme lê, em vez de acumular a view inteira em
+		// memória antes de mandar pro Kafka.
+		batch := make([]map[string]any, 0, fetchSize)
+		total := 0
 		for rows.Next() {
 			row, err := rowToMap(rows)
 			if err != nil {
@@ -1042,17 +1079,29 @@ func refreshViews(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Write
 				return err
 			}
 			batch = append(batch, row)
+			if len(batch) >= fetchSize {
+				if err := publishRowsBatch(ctx, producer, v.qualified(), batch, nil, opSnapshot); err != nil {
+					rows.Close()
+					return fmt.Errorf("publicar lote da view %s: %w", v.qualified(), err)
+				}
+				total += len(batch)
+				metricSnapshotRows.WithLabelValues(v.qualified()).Add(float64(len(batch)))
+				batch = batch[:0]
+			}
 		}
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
 			return err
 		}
-		if err := publishRowsBatch(ctx, producer, v.qualified(), batch, nil, opSnapshot); err != nil {
-			return fmt.Errorf("publicar linhas da view %s: %w", v.qualified(), err)
+		if len(batch) > 0 {
+			if err := publishRowsBatch(ctx, producer, v.qualified(), batch, nil, opSnapshot); err != nil {
+				return fmt.Errorf("publicar lote da view %s: %w", v.qualified(), err)
+			}
+			total += len(batch)
+			metricSnapshotRows.WithLabelValues(v.qualified()).Add(float64(len(batch)))
 		}
-		metricSnapshotRows.WithLabelValues(v.qualified()).Add(float64(len(batch)))
-		vlog.Info("refresh periódico da view concluído", zap.Int("linhas", len(batch)))
+		vlog.Info("refresh periódico da view concluído", zap.Int("linhas", total))
 	}
 	return tx.Commit(ctx)
 }
@@ -1359,7 +1408,7 @@ func boolToFloat(b bool) float64 {
 	return 0
 }
 
-func runViewRefreshLoop(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Writer, views []tableInfo, interval time.Duration, log *zap.Logger) {
+func runViewRefreshLoop(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Writer, views []tableInfo, interval time.Duration, fetchSize int, log *zap.Logger) {
 	if interval <= 0 || len(views) == 0 {
 		return
 	}
@@ -1370,7 +1419,7 @@ func runViewRefreshLoop(ctx context.Context, pool *pgxpool.Pool, producer *kafka
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := refreshViews(ctx, pool, producer, views, log); err != nil {
+			if err := refreshViews(ctx, pool, producer, views, fetchSize, log); err != nil {
 				log.Error("falha ao atualizar snapshot das views", zap.Error(err))
 			}
 		}
@@ -1388,6 +1437,7 @@ var pipelineOnce sync.Once
 // pipeline inteira (bootstrap do slot, snapshot inicial, streaming de CDC,
 // monitor) é iniciada aqui em background e roda até o processo morrer.
 func initVars(ctx context.Context, log *zap.Logger) error {
+	applyContainerMemoryLimit(log)
 	pipelineOnce.Do(func() {
 		// Usa um context próprio, não o recebido aqui: o ctx de initVars pode
 		// ter escopo só da inicialização, e a pipeline precisa sobreviver por
@@ -1395,6 +1445,59 @@ func initVars(ctx context.Context, log *zap.Logger) error {
 		go runPipelineForever(context.Background(), log)
 	})
 	return nil
+}
+
+// applyContainerMemoryLimit dá ao GC do Go um teto suave (runtime/debug.
+// SetMemoryLimit) baseado no limite real do cgroup do pod. Sem isso, o
+// runtime só reage ao crescimento do heap pela heurística padrão (GOGC=100),
+// sem saber que existe um limite duro do Kubernetes logo ali — num pico de
+// alocação (lote grande de snapshot rodando em paralelo, por exemplo) isso
+// pode passar do MEM LIM do pod antes do GC ter motivo pra agir, resultando
+// em OOMKilled mesmo com uso médio de memória baixo. Se GOMEMLIMIT já
+// estiver setado explicitamente no ambiente, respeita e não mexe — o
+// runtime do Go já lê essa env var sozinho, isso aqui é só o fallback pra
+// quando ninguém configurou nada.
+func applyContainerMemoryLimit(log *zap.Logger) {
+	if _, set := os.LookupEnv("GOMEMLIMIT"); set {
+		return
+	}
+	limit, err := readCgroupMemoryLimit()
+	if err != nil {
+		return
+	}
+	// 90%: deixa folga pra memória que o Go não conta no heap (stacks de
+	// goroutine, buffers de rede/cgo) sem abrir mão da maior parte do teto.
+	soft := int64(float64(limit) * 0.9)
+	debug.SetMemoryLimit(soft)
+	log.Info("GOMEMLIMIT aplicado automaticamente a partir do limite do cgroup",
+		zap.Int64("cgroup_limit_bytes", limit), zap.Int64("soft_limit_bytes", soft))
+}
+
+// readCgroupMemoryLimit lê o limite de memória do container: cgroup v2
+// primeiro (padrão em kernels/K8s recentes), com fallback pra v1. Retorna
+// erro se não achar nenhum dos dois arquivos ou se o cgroup não tiver limite
+// definido (rodando fora de container, por exemplo).
+func readCgroupMemoryLimit() (int64, error) {
+	if raw, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		s := strings.TrimSpace(string(raw))
+		if s == "max" {
+			return 0, fmt.Errorf("cgroup v2 sem limite definido")
+		}
+		return strconv.ParseInt(s, 10, 64)
+	}
+	if raw, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		v, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		// cgroup v1 sem limite reporta um valor gigante (perto do teto do
+		// tipo) em vez de "max" como o v2 — filtra esse caso.
+		if v > 1<<62 {
+			return 0, fmt.Errorf("cgroup v1 sem limite definido")
+		}
+		return v, nil
+	}
+	return 0, fmt.Errorf("nenhum arquivo de limite de cgroup encontrado")
 }
 
 // runPipelineForever faz bootstrap + streaming, e se cair por erro (conexão
@@ -1511,7 +1614,7 @@ func runPipelineOnce(ctx context.Context, log *zap.Logger) error {
 	}
 
 	go runSlotMonitor(ctx, pool, cfg.SlotName, cfg.SlotLagWarnBytes, cfg.SlotMonitorInterval, log)
-	go runViewRefreshLoop(ctx, pool, producer, views, cfg.ViewRefreshInterval, log)
+	go runViewRefreshLoop(ctx, pool, producer, views, cfg.ViewRefreshInterval, cfg.SnapshotFetchSize, log)
 
 	rep := newReplicator(cfg.SlotName, cfg.PublicationName, producer, stateWriter, cfg.StatusUpdateInterval, log)
 	err = rep.run(ctx, replConn, st, startLSN)
