@@ -144,6 +144,20 @@ const maxSnapshotWorkers = 12
 // tuning, é risco.
 const maxSnapshotFetchSize = 20000
 
+// maxSnapshotBatchRows é um teto sobre o PRODUTO SnapshotWorkers ×
+// SnapshotFetchSize. Os dois tetos acima, cada um aplicado isoladamente,
+// ainda permitem a pior combinação dos dois ao mesmo tempo (12 workers ×
+// 20000 linhas = 240000 linhas em memória simultaneamente, uma por worker
+// paralelo) — exatamente o cenário de OOMKilled que os comentários deles já
+// descreviam mas nenhum dos dois de fato bloqueava sozinho. 160000 é o
+// próprio produto do cenário de referência documentado no README (8
+// workers × 20000 linhas para 83M linhas/12 partições) — pedir mais que
+// isso ao mesmo tempo já não é mais o "modo turbo" documentado, é risco não
+// coberto. Quando o produto estoura, reduz SNAPSHOT_FETCH_SIZE (não
+// SNAPSHOT_WORKERS): o paralelismo entre partições é o que dá o ganho real
+// de I/O no Postgres — o lote por worker é o que sobra pra cortar.
+const maxSnapshotBatchRows = 160_000
+
 func loadSourceConfig(log *zap.Logger) (*sourceConfig, error) {
 	// Defaults conservadores de propósito: o pico de memória do snapshot
 	// escala com SnapshotWorkers × SnapshotFetchSize (cada worker segura um
@@ -163,6 +177,16 @@ func loadSourceConfig(log *zap.Logger) (*sourceConfig, error) {
 		log.Warn("SNAPSHOT_FETCH_SIZE acima do teto de segurança, limitando",
 			zap.Int("solicitado", snapshotFetchSize), zap.Int("teto", maxSnapshotFetchSize))
 		snapshotFetchSize = maxSnapshotFetchSize
+	}
+
+	if product := snapshotWorkers * snapshotFetchSize; product > maxSnapshotBatchRows {
+		adjusted := maxSnapshotBatchRows / snapshotWorkers
+		log.Warn("SNAPSHOT_WORKERS × SNAPSHOT_FETCH_SIZE acima do teto combinado de segurança, reduzindo SNAPSHOT_FETCH_SIZE",
+			zap.Int("snapshot_workers", snapshotWorkers),
+			zap.Int("snapshot_fetch_size_solicitado", snapshotFetchSize),
+			zap.Int("snapshot_fetch_size_ajustado", adjusted),
+			zap.Int("teto_combinado", maxSnapshotBatchRows))
+		snapshotFetchSize = adjusted
 	}
 
 	cfg := &sourceConfig{
@@ -405,49 +429,40 @@ const (
 	opDelete   cdcOp = "d"
 )
 
-func publishRow(ctx context.Context, writer *kafka.Writer, table string, keyValues, row map[string]any, op cdcOp, lsn string) error {
+// encodeMessage monta a mensagem Kafka na convenção usada por todo o
+// pipeline (snapshot e CDC): key = colunas de PK/replica identity, value =
+// linha completa (nil no delete), headers = table/op/ts/lsn. Única
+// implementação de encoding — antes existiam três (publishRow,
+// publishTombstone, publishRowsBatch) fazendo o mesmo par de json.Marshal.
+func encodeMessage(table string, keyValues, row map[string]any, op cdcOp, lsn string) (kafka.Message, error) {
 	key, err := json.Marshal(keyValues)
 	if err != nil {
-		return fmt.Errorf("encode key: %w", err)
+		return kafka.Message{}, fmt.Errorf("encode key: %w", err)
 	}
-	value, err := json.Marshal(row)
-	if err != nil {
-		return fmt.Errorf("encode value: %w", err)
+	var value []byte
+	if row != nil {
+		value, err = json.Marshal(row)
+		if err != nil {
+			return kafka.Message{}, fmt.Errorf("encode value: %w", err)
+		}
 	}
-	return writer.WriteMessages(ctx, kafka.Message{Key: key, Value: value, Headers: buildKafkaHeaders(table, op, lsn)})
+	return kafka.Message{Key: key, Value: value, Headers: buildKafkaHeaders(table, op, lsn)}, nil
 }
 
-// publishRowsBatch publica várias linhas numa única chamada ao writer. É o
-// principal ganho de throughput do snapshot em massa: chamar WriteMessages
-// uma vez por linha serializa cada uma no seu próprio round-trip de rede
-// (mesmo o writer batchando internamente, uma chamada síncrona por vez nunca
-// acumula nada pra batchar de verdade); passando o batch inteiro de uma vez
-// o kafka-go consegue de fato agrupar por partição e comprimir antes de mandar.
-func publishRowsBatch(ctx context.Context, writer *kafka.Writer, table string, rows []map[string]any, pkCols []string, op cdcOp) error {
-	if len(rows) == 0 {
-		return nil
+func publishRow(ctx context.Context, writer *kafka.Writer, table string, keyValues, row map[string]any, op cdcOp, lsn string) error {
+	msg, err := encodeMessage(table, keyValues, row, op, lsn)
+	if err != nil {
+		return err
 	}
-	msgs := make([]kafka.Message, len(rows))
-	for i, row := range rows {
-		key, err := json.Marshal(extractKey(row, pkCols))
-		if err != nil {
-			return fmt.Errorf("encode key: %w", err)
-		}
-		value, err := json.Marshal(row)
-		if err != nil {
-			return fmt.Errorf("encode value: %w", err)
-		}
-		msgs[i] = kafka.Message{Key: key, Value: value, Headers: buildKafkaHeaders(table, op, "")}
-	}
-	return writer.WriteMessages(ctx, msgs...)
+	return writer.WriteMessages(ctx, msg)
 }
 
 func publishTombstone(ctx context.Context, writer *kafka.Writer, table string, keyValues map[string]any, lsn string) error {
-	key, err := json.Marshal(keyValues)
+	msg, err := encodeMessage(table, keyValues, nil, opDelete, lsn)
 	if err != nil {
-		return fmt.Errorf("encode key: %w", err)
+		return err
 	}
-	return writer.WriteMessages(ctx, kafka.Message{Key: key, Value: nil, Headers: buildKafkaHeaders(table, opDelete, lsn)})
+	return writer.WriteMessages(ctx, msg)
 }
 
 func buildKafkaHeaders(table string, op cdcOp, lsn string) []kafka.Header {
@@ -657,7 +672,7 @@ func ensurePublication(ctx context.Context, pool *pgxpool.Pool, pubName string, 
 	if !exists {
 		list := make([]string, len(cdcTables))
 		for i, t := range cdcTables {
-			list[i] = pgx.Identifier{t.Schema, t.Name}.Sanitize()
+			list[i] = qualifiedIdent(t)
 		}
 		stmt := fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s WITH (publish_via_partition_root = true)`,
 			pgx.Identifier{pubName}.Sanitize(), strings.Join(list, ", "))
@@ -675,7 +690,7 @@ func ensurePublication(ctx context.Context, pool *pgxpool.Pool, pubName string, 
 			return fmt.Errorf("checar se %s já está na publication: %w", t.qualified(), err)
 		}
 		if !member {
-			missing = append(missing, pgx.Identifier{t.Schema, t.Name}.Sanitize())
+			missing = append(missing, qualifiedIdent(t))
 		}
 	}
 	if len(missing) > 0 {
@@ -891,17 +906,19 @@ func snapshotUnit(ctx context.Context, pool *pgxpool.Pool, producer, stateWriter
 		stateMu.Unlock()
 
 		for {
-			batch, next, err := fetchBatch(ctx, tx, fetchSize, readFromIdent, pkCols, lastPK)
+			msgs, next, err := fetchAndEncodeBatch(ctx, tx, fetchSize, readFromIdent, publishAs, pkCols, lastPK)
 			if err != nil {
 				return rowCount, err
 			}
-			if err := publishRowsBatch(ctx, producer, publishAs, batch, pkCols, opSnapshot); err != nil {
-				return rowCount, fmt.Errorf("publicar batch: %w", err)
+			if len(msgs) > 0 {
+				if err := producer.WriteMessages(ctx, msgs...); err != nil {
+					return rowCount, fmt.Errorf("publicar batch: %w", err)
+				}
 			}
-			rowCount += len(batch)
-			metricSnapshotRows.WithLabelValues(publishAs).Add(float64(len(batch)))
+			rowCount += len(msgs)
+			metricSnapshotRows.WithLabelValues(publishAs).Add(float64(len(msgs)))
 
-			if len(batch) < fetchSize {
+			if len(msgs) < fetchSize {
 				stateMu.Lock()
 				st.Snapshots[stateKey] = tableSnapshotState{Done: true}
 				stateMu.Unlock()
@@ -929,36 +946,12 @@ func snapshotUnit(ctx context.Context, pool *pgxpool.Pool, producer, stateWriter
 		// faz. Sem isso, uma view grande estoura memória de um jeito que
 		// nenhum SNAPSHOT_WORKERS/SNAPSHOT_FETCH_SIZE consegue conter, porque
 		// o limite nunca era respeitado aqui pra começo de conversa.
-		batch := make([]map[string]any, 0, fetchSize)
-		for rows.Next() {
-			row, err := rowToMap(rows)
-			if err != nil {
-				rows.Close()
-				return rowCount, err
-			}
-			batch = append(batch, row)
-			if len(batch) >= fetchSize {
-				if err := publishRowsBatch(ctx, producer, publishAs, batch, nil, opSnapshot); err != nil {
-					rows.Close()
-					return rowCount, fmt.Errorf("publicar lote da view: %w", err)
-				}
-				rowCount += len(batch)
-				metricSnapshotRows.WithLabelValues(publishAs).Add(float64(len(batch)))
-				batch = batch[:0]
-			}
-		}
-		err = rows.Err()
+		n, err := streamEncodedBatches(ctx, rows, producer, publishAs, fetchSize)
 		rows.Close()
 		if err != nil {
-			return rowCount, err
+			return rowCount, fmt.Errorf("snapshot da view: %w", err)
 		}
-		if len(batch) > 0 {
-			if err := publishRowsBatch(ctx, producer, publishAs, batch, nil, opSnapshot); err != nil {
-				return rowCount, fmt.Errorf("publicar lote da view: %w", err)
-			}
-			rowCount += len(batch)
-			metricSnapshotRows.WithLabelValues(publishAs).Add(float64(len(batch)))
-		}
+		rowCount = n
 		stateMu.Lock()
 		st.Snapshots[stateKey] = tableSnapshotState{Done: true}
 		stateMu.Unlock()
@@ -973,10 +966,16 @@ func snapshotUnit(ctx context.Context, pool *pgxpool.Pool, producer, stateWriter
 	return rowCount, tx.Commit(ctx)
 }
 
-// fetchBatch pagina por keyset (WHERE pk > último visto) em vez de OFFSET —
-// mais barato e estável em tabelas grandes. readFromIdent já vem sanitizado
-// (schema.tabela ou schema.partição), pkCols só os nomes das colunas.
-func fetchBatch(ctx context.Context, tx pgx.Tx, fetchSize int, readFromIdent string, pkCols []string, lastPK []any) ([]map[string]any, []any, error) {
+// fetchAndEncodeBatch pagina por keyset (WHERE pk > último visto) em vez de
+// OFFSET — mais barato e estável em tabelas grandes — e já codifica cada
+// linha como kafka.Message durante a leitura, em vez de montar o lote
+// decodificado (map[string]any) inteiro e só depois convertê-lo pra
+// mensagem numa segunda passada: manter as duas representações da mesma
+// linha vivas ao mesmo tempo dobra à toa o pico de memória de um lote
+// grande, que é justamente o cenário que derruba o pod com OOMKilled.
+// readFromIdent já vem sanitizado (schema.tabela ou schema.partição),
+// pkCols só os nomes das colunas.
+func fetchAndEncodeBatch(ctx context.Context, tx pgx.Tx, fetchSize int, readFromIdent, publishAs string, pkCols []string, lastPK []any) ([]kafka.Message, []any, error) {
 	orderCols := make([]string, len(pkCols))
 	for i, c := range pkCols {
 		orderCols[i] = pgx.Identifier{c}.Sanitize()
@@ -1001,28 +1000,75 @@ func fetchBatch(ctx context.Context, tx pgx.Tx, fetchSize int, readFromIdent str
 	}
 	defer rows.Close()
 
-	var batch []map[string]any
-	var lastRow map[string]any
+	msgs := make([]kafka.Message, 0, fetchSize)
+	var next []any
 	for rows.Next() {
 		row, err := rowToMap(rows)
 		if err != nil {
 			return nil, nil, err
 		}
-		batch = append(batch, row)
-		lastRow = row
+		msg, err := encodeMessage(publishAs, extractKey(row, pkCols), row, opSnapshot, "")
+		if err != nil {
+			return nil, nil, fmt.Errorf("codificar linha: %w", err)
+		}
+		msgs = append(msgs, msg)
+
+		next = make([]any, len(pkCols))
+		for i, c := range pkCols {
+			next[i] = row[c]
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
+	return msgs, next, nil
+}
 
-	var next []any
-	if lastRow != nil {
-		next = make([]any, len(pkCols))
-		for i, c := range pkCols {
-			next[i] = lastRow[c]
+// streamEncodedBatches lê linhas sem paginação por PK (usado por view/
+// materialized view, que não tem cursor confiável) e publica em lotes de
+// fetchSize conforme lê, codificando cada linha assim que é decodificada —
+// nunca segura mais que um lote em memória, e nunca duas representações da
+// mesma linha ao mesmo tempo. Reusada pelo snapshot inicial de view e pelo
+// refresh periódico, que tinham essa lógica de acumular+publicar duplicada.
+func streamEncodedBatches(ctx context.Context, rows pgx.Rows, producer *kafka.Writer, publishAs string, fetchSize int) (int, error) {
+	msgs := make([]kafka.Message, 0, fetchSize)
+	total := 0
+	flush := func() error {
+		if len(msgs) == 0 {
+			return nil
+		}
+		if err := producer.WriteMessages(ctx, msgs...); err != nil {
+			return fmt.Errorf("publicar lote: %w", err)
+		}
+		total += len(msgs)
+		metricSnapshotRows.WithLabelValues(publishAs).Add(float64(len(msgs)))
+		msgs = msgs[:0]
+		return nil
+	}
+
+	for rows.Next() {
+		row, err := rowToMap(rows)
+		if err != nil {
+			return total, err
+		}
+		msg, err := encodeMessage(publishAs, extractKey(row, nil), row, opSnapshot, "")
+		if err != nil {
+			return total, fmt.Errorf("codificar linha: %w", err)
+		}
+		msgs = append(msgs, msg)
+		if len(msgs) >= fetchSize {
+			if err := flush(); err != nil {
+				return total, err
+			}
 		}
 	}
-	return batch, next, nil
+	if err := rows.Err(); err != nil {
+		return total, err
+	}
+	if err := flush(); err != nil {
+		return total, err
+	}
+	return total, nil
 }
 
 func rowToMap(rows pgx.Rows) (map[string]any, error) {
@@ -1067,39 +1113,10 @@ func refreshViews(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Write
 		if err != nil {
 			return fmt.Errorf("query na view %s: %w", v.qualified(), err)
 		}
-		// Mesmo raciocínio do snapshot inicial de view: publica em lotes de
-		// fetchSize conforme lê, em vez de acumular a view inteira em
-		// memória antes de mandar pro Kafka.
-		batch := make([]map[string]any, 0, fetchSize)
-		total := 0
-		for rows.Next() {
-			row, err := rowToMap(rows)
-			if err != nil {
-				rows.Close()
-				return err
-			}
-			batch = append(batch, row)
-			if len(batch) >= fetchSize {
-				if err := publishRowsBatch(ctx, producer, v.qualified(), batch, nil, opSnapshot); err != nil {
-					rows.Close()
-					return fmt.Errorf("publicar lote da view %s: %w", v.qualified(), err)
-				}
-				total += len(batch)
-				metricSnapshotRows.WithLabelValues(v.qualified()).Add(float64(len(batch)))
-				batch = batch[:0]
-			}
-		}
-		err = rows.Err()
+		total, err := streamEncodedBatches(ctx, rows, producer, v.qualified(), fetchSize)
 		rows.Close()
 		if err != nil {
-			return err
-		}
-		if len(batch) > 0 {
-			if err := publishRowsBatch(ctx, producer, v.qualified(), batch, nil, opSnapshot); err != nil {
-				return fmt.Errorf("publicar lote da view %s: %w", v.qualified(), err)
-			}
-			total += len(batch)
-			metricSnapshotRows.WithLabelValues(v.qualified()).Add(float64(len(batch)))
+			return fmt.Errorf("refresh da view %s: %w", v.qualified(), err)
 		}
 		vlog.Info("refresh periódico da view concluído", zap.Int("linhas", total))
 	}

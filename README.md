@@ -240,6 +240,15 @@ brokers e boa capacidade de máquina":
 > rápido demais e derruba o pod com `OOMKilled` no meio do bootstrap. Valor
 > acima do teto é limitado, com um `warn` no log avisando o clamp.
 >
+> Os dois tetos acima, isolados, ainda deixam passar a pior combinação dos
+> dois ao mesmo tempo (12 workers × 20000 linhas = 240000 linhas em memória
+> simultaneamente). Por isso existe um **terceiro teto sobre o produto**
+> `SNAPSHOT_WORKERS × SNAPSHOT_FETCH_SIZE`, de 160000 — o mesmo produto do
+> cenário de referência abaixo (8 × 20000). Se o produto estourar, o código
+> reduz `SNAPSHOT_FETCH_SIZE` sozinho (não `SNAPSHOT_WORKERS`, já que o
+> paralelismo entre partições é o que dá o ganho real de I/O), com `warn` no
+> log mostrando o valor ajustado.
+>
 > Além dos tetos, o node também configura sozinho um **teto suave de GC**
 > (`runtime/debug.SetMemoryLimit`, ~90% do `MEM LIM` do pod) lendo o cgroup
 > do container na inicialização — não depende de nenhuma env var nova. Isso
