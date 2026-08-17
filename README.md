@@ -177,6 +177,7 @@ delete (testa o streaming de CDC).
 | `PG_POOL_MAX_CONNS` | não | Plain | Default `SNAPSHOT_WORKERS + 6`. Tamanho do pool de conexões do Postgres |
 | `KAFKA_BATCH_SIZE` | não | Plain | Default `1000`. Linhas por lote no producer Kafka |
 | `KAFKA_BATCH_BYTES` | não | Plain | Default `5MB`. Bytes por lote no producer Kafka |
+| `KAFKA_COMPRESSION` | não | Plain | Default `lz4`. Codec de compressão do producer: `lz4`, `snappy`, `gzip`, `zstd` ou `none`. Ajuste pra bater com o padrão do seu cluster Kafka |
 | `STATUS_UPDATE_INTERVAL_SECONDS` | não | Plain | Default `10`. Frequência do feedback ao Postgres (avança `confirmed_flush_lsn`, o que permite reciclar WAL) |
 | `SLOT_MONITOR_INTERVAL_SECONDS` | não | Plain | Default `30`. Frequência da checagem de lag do slot |
 | `SLOT_LAG_WARN_BYTES` | não | Plain | Default `512MB`. Acima disso, loga warning + métrica de WAL retido |

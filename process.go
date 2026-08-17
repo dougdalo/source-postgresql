@@ -120,6 +120,9 @@ type sourceConfig struct {
 
 	KafkaBatchSize  int
 	KafkaBatchBytes int64
+	// KafkaCompression: "lz4" (default — bate com o padrão do cluster),
+	// "snappy", "gzip", "zstd" ou "none".
+	KafkaCompression string
 
 	StatusUpdateInterval time.Duration
 	SlotMonitorInterval  time.Duration
@@ -207,6 +210,7 @@ func loadSourceConfig(log *zap.Logger) (*sourceConfig, error) {
 		PGPoolMaxConns:       int32(envInt("PG_POOL_MAX_CONNS", snapshotWorkers+6)),
 		KafkaBatchSize:       envInt("KAFKA_BATCH_SIZE", 1000),
 		KafkaBatchBytes:      envInt64("KAFKA_BATCH_BYTES", 5*1024*1024),
+		KafkaCompression:     strings.ToLower(envOrDefault("KAFKA_COMPRESSION", "lz4")),
 		StatusUpdateInterval: time.Duration(envInt("STATUS_UPDATE_INTERVAL_SECONDS", 10)) * time.Second,
 		SlotMonitorInterval:  time.Duration(envInt("SLOT_MONITOR_INTERVAL_SECONDS", 30)) * time.Second,
 		SlotLagWarnBytes:     envInt64("SLOT_LAG_WARN_BYTES", 512*1024*1024),
@@ -262,6 +266,28 @@ func resolveKafkaBrokers() []string {
 		return brokers
 	}
 	return splitCSV(os.Getenv("INTHUB_KAFKA_CONNECTION"))
+}
+
+// resolveKafkaCompression mapeia KAFKA_COMPRESSION pro codec do kafka-go.
+// Default é lz4 pra já sair alinhado com o padrão do cluster (menor uso de
+// disco no broker); nome desconhecido cai pra lz4 também, com um warning,
+// em vez de derrubar o node por causa de um typo na env var.
+func resolveKafkaCompression(name string, log *zap.Logger) kafka.Compression {
+	switch name {
+	case "lz4":
+		return kafka.Lz4
+	case "snappy":
+		return kafka.Snappy
+	case "gzip":
+		return kafka.Gzip
+	case "zstd":
+		return kafka.Zstd
+	case "none":
+		return kafka.Compression(0)
+	default:
+		log.Warn("KAFKA_COMPRESSION desconhecido, usando lz4", zap.String("valor_recebido", name))
+		return kafka.Lz4
+	}
 }
 
 func splitCSV(s string) []string {
@@ -1633,7 +1659,7 @@ func runPipelineOnce(ctx context.Context, log *zap.Logger) error {
 		BatchSize:    cfg.KafkaBatchSize,
 		BatchBytes:   cfg.KafkaBatchBytes,
 		BatchTimeout: 100 * time.Millisecond,
-		Compression:  kafka.Snappy,
+		Compression:  resolveKafkaCompression(cfg.KafkaCompression, log),
 	}
 	defer producer.Close() //nolint:errcheck
 
