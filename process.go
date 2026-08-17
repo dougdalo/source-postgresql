@@ -399,13 +399,52 @@ type singlePartitionBalancer struct{}
 
 func (singlePartitionBalancer) Balance(_ kafka.Message, _ ...int) int { return 0 }
 
+// kafkaWriteRetryAttempts/kafkaWriteRetryBackoff cobrem o caso do
+// OUTPUT_TOPIC/STATE_TOPIC ainda não estar visível pra esse Writer no
+// momento do primeiro write — o platform cria o tópico de forma assíncrona,
+// e o Writer resolve o número de partições via metadata antes de cada
+// WriteMessages, sem retry próprio pra esse passo (só o publish em si tem
+// retry interno). Sem isso, um "Unknown Topic Or Partition" transitório
+// derruba o pipeline inteiro e força reprocessar snapshot sem ponto
+// consistente exportado (cenário de recuperação).
+const (
+	kafkaWriteRetryAttempts = 5
+	kafkaWriteRetryBackoff  = 2 * time.Second
+)
+
+func isRetryableKafkaError(err error) bool {
+	return errors.Is(err, kafka.UnknownTopicOrPartition) ||
+		errors.Is(err, kafka.LeaderNotAvailable) ||
+		errors.Is(err, kafka.NotLeaderForPartition) ||
+		errors.Is(err, kafka.RequestTimedOut)
+}
+
+// writeMessagesWithRetry envolve Writer.WriteMessages com algumas
+// re-tentativas pros erros transitórios de metadata acima — pra qualquer
+// outro erro (ex: mensagem grande demais, contexto cancelado), devolve na
+// primeira tentativa, sem mascarar erro real.
+func writeMessagesWithRetry(ctx context.Context, writer *kafka.Writer, msgs ...kafka.Message) error {
+	var err error
+	for attempt := 0; attempt < kafkaWriteRetryAttempts; attempt++ {
+		if err = writer.WriteMessages(ctx, msgs...); err == nil || !isRetryableKafkaError(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(kafkaWriteRetryBackoff):
+		}
+	}
+	return err
+}
+
 func saveState(ctx context.Context, writer *kafka.Writer, state *pipelineState) error {
 	state.UpdatedAt = time.Now().UTC()
 	value, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	return writer.WriteMessages(ctx, kafka.Message{Key: []byte(stateCheckpointKey), Value: value})
+	return writeMessagesWithRetry(ctx, writer, kafka.Message{Key: []byte(stateCheckpointKey), Value: value})
 }
 
 // =============================================================================
@@ -454,7 +493,7 @@ func publishRow(ctx context.Context, writer *kafka.Writer, table string, keyValu
 	if err != nil {
 		return err
 	}
-	return writer.WriteMessages(ctx, msg)
+	return writeMessagesWithRetry(ctx, writer, msg)
 }
 
 func publishTombstone(ctx context.Context, writer *kafka.Writer, table string, keyValues map[string]any, lsn string) error {
@@ -462,7 +501,7 @@ func publishTombstone(ctx context.Context, writer *kafka.Writer, table string, k
 	if err != nil {
 		return err
 	}
-	return writer.WriteMessages(ctx, msg)
+	return writeMessagesWithRetry(ctx, writer, msg)
 }
 
 func buildKafkaHeaders(table string, op cdcOp, lsn string) []kafka.Header {
@@ -911,7 +950,7 @@ func snapshotUnit(ctx context.Context, pool *pgxpool.Pool, producer, stateWriter
 				return rowCount, err
 			}
 			if len(msgs) > 0 {
-				if err := producer.WriteMessages(ctx, msgs...); err != nil {
+				if err := writeMessagesWithRetry(ctx, producer, msgs...); err != nil {
 					return rowCount, fmt.Errorf("publicar batch: %w", err)
 				}
 			}
@@ -1037,7 +1076,7 @@ func streamEncodedBatches(ctx context.Context, rows pgx.Rows, producer *kafka.Wr
 		if len(msgs) == 0 {
 			return nil
 		}
-		if err := producer.WriteMessages(ctx, msgs...); err != nil {
+		if err := writeMessagesWithRetry(ctx, producer, msgs...); err != nil {
 			return fmt.Errorf("publicar lote: %w", err)
 		}
 		total += len(msgs)
