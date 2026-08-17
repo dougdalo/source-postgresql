@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -506,12 +507,80 @@ func encodeMessage(table string, keyValues, row map[string]any, op cdcOp, lsn st
 	}
 	var value []byte
 	if row != nil {
-		value, err = json.Marshal(row)
+		value, err = json.Marshal(flattenRow(row))
 		if err != nil {
 			return kafka.Message{}, fmt.Errorf("encode value: %w", err)
 		}
 	}
 	return kafka.Message{Key: key, Value: value, Headers: buildKafkaHeaders(table, op, lsn)}, nil
+}
+
+// flattenKeySep separa nível de aninhamento nas chaves achatadas (ex.:
+// "config_limite_valor"). "_" em vez de "." de propósito: o value flat
+// existe pra um sink connector transacionar isso em outra tabela de banco
+// (ver comentário da seção acima), e "." não é um caractere seguro em nome
+// de coluna na maioria dos bancos (Postgres incluso, sem quoting) nem em
+// nome de campo Avro/Kafka Connect — "_" chega direto como coluna válida do
+// outro lado sem tratamento extra.
+const flattenKeySep = "_"
+
+// flattenRow achata colunas json/jsonb com objeto aninhado em chaves
+// "coluna_subchave" no nível raiz do value — o pgx decodifica json/jsonb
+// automaticamente em map[string]any, então sem isso uma coluna desse tipo
+// vira JSON dentro de JSON na mensagem, quebrando a convenção de "value
+// 100% flat" que os sink connectors downstream esperam. Roda
+// incondicionalmente pra qualquer tabela/coluna, sem depender de env var:
+// não faz sentido essa normalização ser opt-in, já que o formato "flat" é a
+// garantia que este node dá pra quem consome o tópico.
+// Array não é expandido por índice — vira uma string com o JSON do array
+// serializado (ex.: "parcelas": "[{...},{...}]") em vez de ficar como valor
+// nativo aninhado. Expandir por índice (ex.: "parcelas_0_valor",
+// "parcelas_1_valor") deixaria o formato instável, com o número de colunas
+// mudando conforme o tamanho do array varia entre linhas (uma lista de
+// parcelas de financiamento pode ter dezenas de itens) — inviável pra um
+// sink JDBC/schema fixo do outro lado. Virar string mantém o value
+// estruturalmente 100% flat (todo valor é escalar) sem gerar esse
+// problema, ao custo de o consumidor ter que decodificar esse campo
+// específico se precisar dos itens individualmente.
+func flattenRow(row map[string]any) map[string]any {
+	flat := make(map[string]any, len(row))
+	// Ordena as chaves de nível raiz antes de achatar pra que, no caso raro
+	// de colisão (coluna "a.b" literal + coluna jsonb "a" com subchave "b"),
+	// o resultado seja determinístico entre execuções, já que a ordem de
+	// iteração de um map em Go não é.
+	keys := make([]string, 0, len(row))
+	for k := range row {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		flattenInto(flat, k, row[k])
+	}
+	return flat
+}
+
+func flattenInto(dst map[string]any, prefix string, v any) {
+	if arr, ok := v.([]any); ok {
+		if b, err := json.Marshal(arr); err == nil {
+			dst[prefix] = string(b)
+		} else {
+			dst[prefix] = v
+		}
+		return
+	}
+	nested, ok := v.(map[string]any)
+	if !ok || len(nested) == 0 {
+		dst[prefix] = v
+		return
+	}
+	subKeys := make([]string, 0, len(nested))
+	for k := range nested {
+		subKeys = append(subKeys, k)
+	}
+	sort.Strings(subKeys)
+	for _, k := range subKeys {
+		flattenInto(dst, prefix+flattenKeySep+k, nested[k])
+	}
 }
 
 func publishRow(ctx context.Context, writer *kafka.Writer, table string, keyValues, row map[string]any, op cdcOp, lsn string) error {

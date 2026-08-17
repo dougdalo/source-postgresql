@@ -195,7 +195,17 @@ automaticamente quando não estiver (função `resolveKafkaBrokers` em
 - **Key**: JSON flat só com as colunas de chave primária. Ex: `{"id": 123}`.
   Views não têm PK confiável, então saem com key vazia `{}`.
 - **Value** (insert/update/snapshot): JSON flat com todas as colunas da
-  linha, tipado (number/bool/timestamp/etc — não tudo string).
+  linha, tipado (number/bool/timestamp/etc — não tudo string). Coluna
+  `json`/`jsonb` com objeto aninhado é achatada em chaves
+  `coluna_subchave` no nível raiz (ex.: `{"config": {"limite": {"valor":
+  500}}}` vira `"config_limite_valor": 500`) — incondicional, não depende
+  de env var. Array dentro de uma coluna `json`/`jsonb` **não** é expandido
+  por índice (schema instável — número de colunas mudaria conforme o
+  tamanho do array varia entre linhas); em vez disso vira uma **string** com
+  o array serializado (ex.: `"parcelas": "[{\"valor\":1},{\"valor\":2}]"`),
+  mantendo o value estruturalmente 100% flat (todo valor é escalar). Quem
+  consumir esse campo precisa decodificar essa string se precisar dos itens
+  individualmente.
 - **Value** (delete): vazio — tombstone, mesma convenção de "delete via CDC"
   que os consumidores desses tópicos já esperam (`value == ""` → delete).
 - **Headers**: `table` (schema.tabela), `op` (`r`=snapshot, `c`=insert,
